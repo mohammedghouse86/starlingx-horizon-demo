@@ -1,0 +1,17 @@
+{
+  "name": "starlingx-horizon-demo",
+  "version": "1.0.0",
+  "description": "Demo replica of the StarlingX Horizon dashboard (projects, users, instances, volumes, networks, hosts, alarms) with seeded data. For testing only.",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "smoke": "node scripts/smoke-test.js http://localhost:3000"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
