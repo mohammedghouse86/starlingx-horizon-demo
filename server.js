@@ -7,11 +7,18 @@ const { seed, hashPassword } = require('./seed');
 
 const PORT = process.env.PORT || 3000;
 const app = express();
+app.disable("x-powered-by"); // Express adds this header by default; the original StarlingX dashboard does not send it
 app.use(express.json({ limit: '100kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const db = seed();
-const sessions = new Map(); // token -> userId
+// token -> { userId, expiresAt }. Same 50-minute timeout as the original StarlingX dashboard (SESSION_TIMEOUT = 3000 s).
+const SESSION_TIMEOUT_MS = 3000 * 1000;
+const sessions = new Map();
+
+function revokeSessionsFor(userId) {
+  for (const [token, s] of sessions) if (s.userId === userId) sessions.delete(token);
+}
 
 // ---------- helpers ----------
 const fail = (res, code, msg) => res.status(code).json({ error: msg });
@@ -22,8 +29,37 @@ const CIDR_RE = /^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/;
 
 const isAdmin = (u) => u.role === 'admin';
 const memberOf = (userId, projectId) => db.memberships.find((m) => m.userId === userId && m.projectId === projectId);
-const canAccessProject = (user, projectId) => isAdmin(user) || !!memberOf(user.id, projectId);
 const findProject = (id) => db.projects.find((p) => p.id === id);
+// Admins can reach every project. Other users need a membership in a project that is enabled.
+const canAccessProject = (user, projectId) => {
+  if (isAdmin(user)) return true;
+  const p = findProject(projectId);
+  return !!memberOf(user.id, projectId) && !!p && p.enabled;
+};
+// Project reader is read-only: writes need the project role admin or member.
+const canWriteProject = (user, projectId) => {
+  if (isAdmin(user)) return true;
+  const m = memberOf(user.id, projectId);
+  return canAccessProject(user, projectId) && !!m && (m.role === 'admin' || m.role === 'member');
+};
+function requireWrite(req, res, projectId) {
+  if (canWriteProject(req.user, projectId)) return true;
+  fail(res, 403, 'Your role in this project is read-only');
+  return false;
+}
+
+// Pages a list. Default and maximum page size is 2000, as in the original StarlingX fault API (limit_max).
+function paged(req, list) {
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 2000, 1), 2000);
+  let start = 0;
+  if (req.query.marker) {
+    const idx = list.findIndex((x) => x.id === req.query.marker);
+    start = idx === -1 ? list.length : idx + 1;
+  }
+  const items = list.slice(start, start + limit);
+  const more = start + limit < list.length;
+  return { items, next: more ? items[items.length - 1].id : null };
+}
 
 function publicUser(u) {
   return {
@@ -59,8 +95,12 @@ function volumeView(v) {
 
 function requireAuth(req, res, next) {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  const userId = token && sessions.get(token);
-  const user = userId && db.users.find((u) => u.id === userId);
+  const s = token && sessions.get(token);
+  if (s && s.expiresAt <= Date.now()) {
+    sessions.delete(token);
+    return fail(res, 401, 'Session expired, please sign in again');
+  }
+  const user = s && db.users.find((u) => u.id === s.userId);
   if (!user || !user.enabled) return fail(res, 401, 'Authentication required');
   req.user = user;
   req.token = token;
@@ -127,7 +167,7 @@ app.post('/api/auth/login', (req, res) => {
     return fail(res, 401, 'Invalid email or password');
   }
   const token = crypto.randomBytes(24).toString('hex');
-  sessions.set(token, user.id);
+  sessions.set(token, { userId: user.id, expiresAt: Date.now() + SESSION_TIMEOUT_MS });
   res.json({ token, user: publicUser(user) });
 });
 
@@ -159,7 +199,8 @@ app.get('/api/overview', requireAuth, (req, res) => {
 // ---------- projects ----------
 app.get('/api/projects', requireAuth, (req, res) => {
   const list = db.projects.filter((p) => canAccessProject(req.user, p.id)).map(projectView);
-  res.json({ projects: list });
+  const { items, next } = paged(req, list);
+  res.json({ projects: items, next });
 });
 
 app.post('/api/projects', requireAuth, requireAdmin, (req, res) => {
@@ -218,9 +259,12 @@ function membersOf(projectId) {
     });
 }
 
-app.get('/api/projects/:id/members', requireAuth, (req, res) => {
+app.get('/api/projects/:id/members', requireAuth, requireAdmin, (req, res) => {
   const p = loadProject(req, res);
-  if (p) res.json({ members: membersOf(p.id) });
+  if (p) {
+    const { items, next } = paged(req, membersOf(p.id).map((m) => ({ ...m, id: m.userId })));
+    res.json({ members: items.map(({ id, ...m }) => m), next });
+  }
 });
 
 app.post('/api/projects/:id/members', requireAuth, requireAdmin, (req, res) => {
@@ -256,7 +300,8 @@ app.delete('/api/projects/:id/members/:userId', requireAuth, requireAdmin, (req,
 
 // ---------- users (admin) ----------
 app.get('/api/users', requireAuth, requireAdmin, (req, res) => {
-  res.json({ users: db.users.map(publicUser) });
+  const { items, next } = paged(req, db.users.map(publicUser));
+  res.json({ users: items, next });
 });
 
 app.post('/api/users', requireAuth, requireAdmin, (req, res) => {
@@ -305,6 +350,7 @@ app.put('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
     if (String(req.body.password).length < 8) return fail(res, 400, 'Password must be at least 8 characters');
     u.salt = crypto.randomBytes(16).toString('hex');
     u.passwordHash = hashPassword(req.body.password, u.salt);
+    revokeSessionsFor(u.id); // a password change ends the user's existing sessions
   }
   res.json({ user: publicUser(u) });
 });
@@ -315,19 +361,23 @@ app.delete('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
   if (u.id === req.user.id) return fail(res, 400, 'You cannot delete your own account');
   db.users = db.users.filter((x) => x.id !== u.id);
   db.memberships = db.memberships.filter((m) => m.userId !== u.id);
-  for (const [token, uid] of sessions) if (uid === u.id) sessions.delete(token);
+  revokeSessionsFor(u.id);
   res.json({ ok: true });
 });
 
 // ---------- instances ----------
 app.get('/api/projects/:id/instances', requireAuth, (req, res) => {
   const p = loadProject(req, res);
-  if (p) res.json({ instances: db.instances.filter((i) => i.projectId === p.id).map(instanceView) });
+  if (p) {
+    const { items, next } = paged(req, db.instances.filter((i) => i.projectId === p.id).map(instanceView));
+    res.json({ instances: items, next });
+  }
 });
 
 app.post('/api/projects/:id/instances', requireAuth, (req, res) => {
   const p = loadProject(req, res);
   if (!p) return;
+  if (!requireWrite(req, res, p.id)) return;
   const name = str(req.body.name, 64);
   if (!name || !NAME_RE.test(name)) return fail(res, 400, 'Invalid instance name');
   const flavor = db.flavors.find((f) => f.name === req.body.flavor);
@@ -368,6 +418,7 @@ const ACTIONS = {
 app.post('/api/instances/:id/action', requireAuth, (req, res) => {
   const inst = instanceFor(req, res);
   if (!inst) return;
+  if (!requireWrite(req, res, inst.projectId)) return;
   const rule = ACTIONS[req.body.action];
   if (!rule) return fail(res, 400, 'Action must be start, stop or reboot');
   if (!rule.from.includes(inst.status)) return fail(res, 409, `Cannot ${req.body.action} an instance in state ${inst.status}`);
@@ -378,6 +429,7 @@ app.post('/api/instances/:id/action', requireAuth, (req, res) => {
 app.delete('/api/instances/:id', requireAuth, (req, res) => {
   const inst = instanceFor(req, res);
   if (!inst) return;
+  if (!requireWrite(req, res, inst.projectId)) return;
   db.volumes.forEach((v) => {
     if (v.attachedTo === inst.id) {
       v.attachedTo = null;
@@ -391,12 +443,16 @@ app.delete('/api/instances/:id', requireAuth, (req, res) => {
 // ---------- volumes ----------
 app.get('/api/projects/:id/volumes', requireAuth, (req, res) => {
   const p = loadProject(req, res);
-  if (p) res.json({ volumes: db.volumes.filter((v) => v.projectId === p.id).map(volumeView) });
+  if (p) {
+    const { items, next } = paged(req, db.volumes.filter((v) => v.projectId === p.id).map(volumeView));
+    res.json({ volumes: items, next });
+  }
 });
 
 app.post('/api/projects/:id/volumes', requireAuth, (req, res) => {
   const p = loadProject(req, res);
   if (!p) return;
+  if (!requireWrite(req, res, p.id)) return;
   const name = str(req.body.name, 64);
   const size = Number(req.body.size);
   if (!name || !NAME_RE.test(name)) return fail(res, 400, 'Invalid volume name');
@@ -420,6 +476,7 @@ app.post('/api/projects/:id/volumes', requireAuth, (req, res) => {
 app.post('/api/volumes/:id/attach', requireAuth, (req, res) => {
   const vol = volumeFor(req, res);
   if (!vol) return;
+  if (!requireWrite(req, res, vol.projectId)) return;
   if (vol.status !== 'available') return fail(res, 409, `Volume is ${vol.status}, not available`);
   const inst = db.instances.find((i) => i.id === req.body.instanceId && i.projectId === vol.projectId);
   if (!inst) return fail(res, 400, 'Choose an instance in the same project');
@@ -431,6 +488,7 @@ app.post('/api/volumes/:id/attach', requireAuth, (req, res) => {
 app.post('/api/volumes/:id/detach', requireAuth, (req, res) => {
   const vol = volumeFor(req, res);
   if (!vol) return;
+  if (!requireWrite(req, res, vol.projectId)) return;
   if (vol.status !== 'in-use') return fail(res, 409, 'Volume is not attached');
   vol.attachedTo = null;
   vol.status = 'available';
@@ -440,6 +498,7 @@ app.post('/api/volumes/:id/detach', requireAuth, (req, res) => {
 app.delete('/api/volumes/:id', requireAuth, (req, res) => {
   const vol = volumeFor(req, res);
   if (!vol) return;
+  if (!requireWrite(req, res, vol.projectId)) return;
   if (vol.status === 'in-use') return fail(res, 409, 'Detach the volume before deleting it');
   db.volumes = db.volumes.filter((v) => v.id !== vol.id);
   res.json({ ok: true });
@@ -448,12 +507,16 @@ app.delete('/api/volumes/:id', requireAuth, (req, res) => {
 // ---------- networks ----------
 app.get('/api/projects/:id/networks', requireAuth, (req, res) => {
   const p = loadProject(req, res);
-  if (p) res.json({ networks: db.networks.filter((n) => n.projectId === p.id) });
+  if (p) {
+    const { items, next } = paged(req, db.networks.filter((n) => n.projectId === p.id));
+    res.json({ networks: items, next });
+  }
 });
 
 app.post('/api/projects/:id/networks', requireAuth, (req, res) => {
   const p = loadProject(req, res);
   if (!p) return;
+  if (!requireWrite(req, res, p.id)) return;
   const name = str(req.body.name, 64);
   const cidr = str(req.body.cidr, 18);
   if (!name || !NAME_RE.test(name)) return fail(res, 400, 'Invalid network name');
@@ -466,21 +529,31 @@ app.post('/api/projects/:id/networks', requireAuth, (req, res) => {
 app.delete('/api/networks/:id', requireAuth, (req, res) => {
   const net = db.networks.find((n) => n.id === req.params.id);
   if (!net) return fail(res, 404, 'Network not found');
-  if (!canAccessProject(req.user, net.projectId)) return fail(res, 403, 'You are not a member of this project');
+  if (!requireWrite(req, res, net.projectId)) return;
   if (db.instances.some((i) => i.networkId === net.id)) return fail(res, 409, 'Network is used by an instance');
   db.networks = db.networks.filter((n) => n.id !== net.id);
   res.json({ ok: true });
 });
 
 // ---------- catalog and platform (admin) ----------
-app.get('/api/flavors', requireAuth, (req, res) => res.json({ flavors: db.flavors }));
-app.get('/api/images', requireAuth, (req, res) => res.json({ images: db.images }));
-app.get('/api/hosts', requireAuth, requireAdmin, (req, res) => res.json({ hosts: db.hosts }));
+app.get('/api/flavors', requireAuth, (req, res) => {
+  const { items, next } = paged(req, db.flavors);
+  res.json({ flavors: items, next });
+});
+app.get('/api/images', requireAuth, (req, res) => {
+  const { items, next } = paged(req, db.images);
+  res.json({ images: items, next });
+});
+app.get('/api/hosts', requireAuth, requireAdmin, (req, res) => {
+  const { items, next } = paged(req, db.hosts);
+  res.json({ hosts: items, next });
+});
 
 app.get('/api/alarms', requireAuth, requireAdmin, (req, res) => {
   const sev = req.query.severity;
   const list = db.alarms.filter((a) => !sev || a.severity === sev);
-  res.json({ alarms: list });
+  const { items, next } = paged(req, list);
+  res.json({ alarms: items, next });
 });
 
 app.post('/api/alarms/:id/clear', requireAuth, requireAdmin, (req, res) => {
@@ -548,7 +621,8 @@ function findDatanet(req, res) {
 }
 
 app.get('/api/datanets', requireAuth, requireAdmin, (req, res) => {
-  res.json({ datanets: db.datanets.map(datanetView) });
+  const { items, next } = paged(req, db.datanets.map(datanetView));
+  res.json({ datanets: items, next });
 });
 
 app.post('/api/datanets', requireAuth, requireAdmin, (req, res) => {
@@ -604,8 +678,14 @@ app.delete('/api/datanets/:id/ranges/:rangeId', requireAuth, requireAdmin, (req,
 });
 
 // ---------- software management (admin) ----------
-app.get('/api/software/releases', requireAuth, requireAdmin, (req, res) => res.json({ releases: db.releases }));
-app.get('/api/software/patches', requireAuth, requireAdmin, (req, res) => res.json({ patches: db.patches }));
+app.get('/api/software/releases', requireAuth, requireAdmin, (req, res) => {
+  const { items, next } = paged(req, db.releases);
+  res.json({ releases: items, next });
+});
+app.get('/api/software/patches', requireAuth, requireAdmin, (req, res) => {
+  const { items, next } = paged(req, db.patches);
+  res.json({ patches: items, next });
+});
 
 app.post('/api/software/patches/:id/apply', requireAuth, requireAdmin, (req, res) => {
   const p = db.patches.find((x) => x.id === req.params.id);
@@ -626,7 +706,8 @@ app.post('/api/software/patches/:id/remove', requireAuth, requireAdmin, (req, re
 // ---------- events (admin, read-only) ----------
 app.get('/api/events', requireAuth, requireAdmin, (req, res) => {
   const sev = req.query.severity;
-  res.json({ events: db.events.filter((e) => !sev || e.severity === sev) });
+  const { items, next } = paged(req, db.events.filter((e) => !sev || e.severity === sev));
+  res.json({ events: items, next });
 });
 
 // ---------- SPA fallback and errors ----------
