@@ -112,6 +112,78 @@ function check(name, cond, extra) {
   const alarms = await call('GET', '/api/alarms', admin);
   check('alarms list', alarms.data.alarms && alarms.data.alarms.length > 0);
 
+  // Fresh member account for the access checks (the earlier one was deleted in cleanup)
+  await call('POST', '/api/users', admin, { name: 'POC Member', email: 'poc.member2@starlingx-demo.example', password: 'Poc@12345', role: 'member' });
+  const m2 = (await call('POST', '/api/auth/login', null, { email: 'poc.member2@starlingx-demo.example', password: 'Poc@12345' })).data.token;
+
+  // Host inventory
+  const hosts = await call('GET', '/api/hosts', admin);
+  const hid = hosts.data.hosts[2].id;   // a worker
+  const ctrl = hosts.data.hosts[0].id;  // a controller
+  const hostDetail = await call('GET', `/api/hosts/${hid}`, admin);
+  check('host detail', hostDetail.data.host && hostDetail.data.host.id === hid, hostDetail);
+  for (const section of ['cpus', 'devices', 'filesystems', 'interfaces', 'labels', 'lldp', 'memories', 'ports', 'sensors', 'storages']) {
+    const s = await call('GET', `/api/hosts/${hid}/${section}`, admin);
+    check(`host inventory ${section} has rows`, s.status === 200 && Array.isArray(s.data[section]) && s.data[section].length > 0, s.data);
+  }
+  const badSection = await call('GET', `/api/hosts/${hid}/nope`, admin);
+  check('unknown inventory section rejected', badSection.status === 404);
+  const forbiddenHost = await call('GET', `/api/hosts/${hid}/cpus`, m2);
+  check('member blocked from host inventory', forbiddenHost.status === 403);
+  const lockCtrl = await call('POST', `/api/hosts/${ctrl}/lock`, admin);
+  check('controller lock rejected', lockCtrl.status === 409);
+  const lock = await call('POST', `/api/hosts/${hid}/lock`, admin);
+  check('lock worker host', lock.data.host && lock.data.host.administrative === 'locked', lock);
+  const relock = await call('POST', `/api/hosts/${hid}/lock`, admin);
+  check('re-lock rejected', relock.status === 409);
+  const unlock = await call('POST', `/api/hosts/${hid}/unlock`, admin);
+  check('unlock worker host', unlock.data.host && unlock.data.host.administrative === 'unlocked', unlock);
+
+  // Data networks
+  const dn = await call('POST', '/api/datanets', admin, { name: 'poc-physnet', network_type: 'vlan', mtu: 9000, description: 'Smoke' });
+  check('create data network', dn.status === 201, dn);
+  const dnid = dn.data.datanet.id;
+  const badDn = await call('POST', '/api/datanets', admin, { name: 'poc-physnet', network_type: 'vlan', mtu: 9000 });
+  check('duplicate data network rejected', badDn.status === 409);
+  const range = await call('POST', `/api/datanets/${dnid}/ranges`, admin, { start: 300, end: 399 });
+  check('add vlan range', range.status === 201 && range.data.datanet.rangeCount === 1, range);
+  const overlap = await call('POST', `/api/datanets/${dnid}/ranges`, admin, { start: 350, end: 360 });
+  check('overlapping range rejected', overlap.status === 409);
+  const badVlan = await call('POST', `/api/datanets/${dnid}/ranges`, admin, { start: 1, end: 5000 });
+  check('vlan id above 4094 rejected', badVlan.status === 400);
+  const rangeId = range.data.datanet.ranges[0].id;
+  const delRange = await call('DELETE', `/api/datanets/${dnid}/ranges/${rangeId}`, admin);
+  check('delete range', delRange.status === 200 && delRange.data.datanet.rangeCount === 0);
+  const delDn = await call('DELETE', `/api/datanets/${dnid}`, admin);
+  check('delete data network', delDn.status === 200);
+  const ifaces = await call('GET', `/api/hosts/${hid}/interfaces`, admin);
+  const usedName = ifaces.data.interfaces.find((i) => i.datanet).datanet;
+  const usedDn = (await call('GET', '/api/datanets', admin)).data.datanets.find((d) => d.name === usedName);
+  const inUse = await call('DELETE', `/api/datanets/${usedDn.id}`, admin);
+  check('data network used by host interface rejected', inUse.status === 409, inUse);
+
+  // Software management
+  const patches = await call('GET', '/api/software/patches', admin);
+  const available = patches.data.patches.find((p) => p.status === 'Available');
+  const applied = await call('POST', `/api/software/patches/${available.id}/apply`, admin);
+  check('apply patch', applied.data.patch && applied.data.patch.status === 'Applied', applied);
+  const reapply = await call('POST', `/api/software/patches/${available.id}/apply`, admin);
+  check('re-apply patch rejected', reapply.status === 409);
+  const removed = await call('POST', `/api/software/patches/${available.id}/remove`, admin);
+  check('remove patch', removed.data.patch && removed.data.patch.status === 'Available', removed);
+  const releases = await call('GET', '/api/software/releases', admin);
+  check('releases list', releases.data.releases && releases.data.releases.length > 0);
+  const patchMember = await call('GET', '/api/software/patches', m2);
+  check('member blocked from software management', patchMember.status === 403);
+
+  // Events
+  const events = await call('GET', '/api/events', admin);
+  check('events list', events.data.events && events.data.events.length > 0);
+  const crit = await call('GET', '/api/events?severity=critical', admin);
+  check('events severity filter', crit.data.events && crit.data.events.every((e) => e.severity === 'critical'));
+  const eventsMember = await call('GET', '/api/events', m2);
+  check('member blocked from events', eventsMember.status === 403);
+
   console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);
 })().catch((err) => {

@@ -491,6 +491,144 @@ app.post('/api/alarms/:id/clear', requireAuth, requireAdmin, (req, res) => {
   res.json({ alarm: a });
 });
 
+// ---------- host inventory (admin) ----------
+const HOST_SECTIONS = ['cpus', 'devices', 'filesystems', 'interfaces', 'labels', 'lldp', 'memories', 'ports', 'sensors', 'storages'];
+
+function findHost(req, res) {
+  const h = db.hosts.find((x) => x.id === req.params.id);
+  if (!h) fail(res, 404, 'Host not found');
+  return h || null;
+}
+
+app.get('/api/hosts/:id', requireAuth, requireAdmin, (req, res) => {
+  const h = findHost(req, res);
+  if (h) res.json({ host: h });
+});
+
+app.get('/api/hosts/:id/:section', requireAuth, requireAdmin, (req, res) => {
+  const h = findHost(req, res);
+  if (!h) return;
+  if (!HOST_SECTIONS.includes(req.params.section)) return fail(res, 404, 'Unknown inventory section');
+  const rows = db.hostSubs[req.params.section].filter((x) => x.hostId === h.id);
+  res.json({ [req.params.section]: rows });
+});
+
+app.post('/api/hosts/:id/lock', requireAuth, requireAdmin, (req, res) => {
+  const h = findHost(req, res);
+  if (!h) return;
+  if (h.personality === 'controller') return fail(res, 409, 'Controllers cannot be locked in this demo');
+  if (h.administrative === 'locked') return fail(res, 409, 'Host is already locked');
+  h.administrative = 'locked';
+  h.operational = 'disabled';
+  h.availability = 'online';
+  res.json({ host: h });
+});
+
+app.post('/api/hosts/:id/unlock', requireAuth, requireAdmin, (req, res) => {
+  const h = findHost(req, res);
+  if (!h) return;
+  if (h.administrative === 'unlocked') return fail(res, 409, 'Host is already unlocked');
+  h.administrative = 'unlocked';
+  h.operational = 'enabled';
+  h.availability = 'available';
+  res.json({ host: h });
+});
+
+// ---------- data networks (admin) ----------
+const DATANET_TYPES = ['vlan', 'flat', 'vxlan'];
+
+function datanetView(d) {
+  return { ...d, rangeCount: d.ranges.length };
+}
+
+function findDatanet(req, res) {
+  const d = db.datanets.find((x) => x.id === req.params.id);
+  if (!d) fail(res, 404, 'Data network not found');
+  return d || null;
+}
+
+app.get('/api/datanets', requireAuth, requireAdmin, (req, res) => {
+  res.json({ datanets: db.datanets.map(datanetView) });
+});
+
+app.post('/api/datanets', requireAuth, requireAdmin, (req, res) => {
+  const name = str(req.body.name, 64);
+  const mtu = Number(req.body.mtu || 1500);
+  if (!name || !NAME_RE.test(name)) return fail(res, 400, 'Invalid data network name');
+  if (!DATANET_TYPES.includes(req.body.network_type)) return fail(res, 400, 'Type must be vlan, flat or vxlan');
+  if (!Number.isInteger(mtu) || mtu < 1280 || mtu > 9216) return fail(res, 400, 'MTU must be between 1280 and 9216');
+  if (db.datanets.some((d) => d.name === name)) return fail(res, 409, 'A data network with this name already exists');
+  const d = {
+    id: crypto.randomUUID(), name, network_type: req.body.network_type, mtu,
+    description: str(req.body.description, 255) || '', ranges: [], createdAt: new Date().toISOString(),
+  };
+  db.datanets.push(d);
+  res.status(201).json({ datanet: datanetView(d) });
+});
+
+app.get('/api/datanets/:id', requireAuth, requireAdmin, (req, res) => {
+  const d = findDatanet(req, res);
+  if (d) res.json({ datanet: datanetView(d) });
+});
+
+app.delete('/api/datanets/:id', requireAuth, requireAdmin, (req, res) => {
+  const d = findDatanet(req, res);
+  if (!d) return;
+  if (db.hostSubs.interfaces.some((i) => i.datanet === d.name)) return fail(res, 409, 'Data network is used by a host interface');
+  db.datanets = db.datanets.filter((x) => x.id !== d.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/datanets/:id/ranges', requireAuth, requireAdmin, (req, res) => {
+  const d = findDatanet(req, res);
+  if (!d) return;
+  const start = Number(req.body.start);
+  const end = Number(req.body.end);
+  const max = d.network_type === 'vlan' ? 4094 : 16777215;
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end > max || start > end) {
+    return fail(res, 400, `Range must be whole numbers from 1 to ${max}, start not greater than end`);
+  }
+  if (d.network_type === 'flat') return fail(res, 409, 'Flat networks do not use ranges');
+  if (d.ranges.some((r) => start <= r.end && end >= r.start)) return fail(res, 409, 'Range overlaps an existing range');
+  d.ranges.push({ id: crypto.randomUUID(), start, end });
+  res.status(201).json({ datanet: datanetView(d) });
+});
+
+app.delete('/api/datanets/:id/ranges/:rangeId', requireAuth, requireAdmin, (req, res) => {
+  const d = findDatanet(req, res);
+  if (!d) return;
+  const before = d.ranges.length;
+  d.ranges = d.ranges.filter((r) => r.id !== req.params.rangeId);
+  if (d.ranges.length === before) return fail(res, 404, 'Range not found');
+  res.json({ datanet: datanetView(d) });
+});
+
+// ---------- software management (admin) ----------
+app.get('/api/software/releases', requireAuth, requireAdmin, (req, res) => res.json({ releases: db.releases }));
+app.get('/api/software/patches', requireAuth, requireAdmin, (req, res) => res.json({ patches: db.patches }));
+
+app.post('/api/software/patches/:id/apply', requireAuth, requireAdmin, (req, res) => {
+  const p = db.patches.find((x) => x.id === req.params.id);
+  if (!p) return fail(res, 404, 'Patch not found');
+  if (p.status !== 'Available') return fail(res, 409, `Patch is ${p.status}, not Available`);
+  p.status = 'Applied';
+  res.json({ patch: p });
+});
+
+app.post('/api/software/patches/:id/remove', requireAuth, requireAdmin, (req, res) => {
+  const p = db.patches.find((x) => x.id === req.params.id);
+  if (!p) return fail(res, 404, 'Patch not found');
+  if (p.status !== 'Applied') return fail(res, 409, `Patch is ${p.status}, not Applied`);
+  p.status = 'Available';
+  res.json({ patch: p });
+});
+
+// ---------- events (admin, read-only) ----------
+app.get('/api/events', requireAuth, requireAdmin, (req, res) => {
+  const sev = req.query.severity;
+  res.json({ events: db.events.filter((e) => !sev || e.severity === sev) });
+});
+
 // ---------- SPA fallback and errors ----------
 app.use((req, res, next) => {
   if (req.method === 'GET' && !req.path.startsWith('/api/')) {

@@ -119,8 +119,15 @@
     { title: 'Admin', admin: true, items: [
       ['#/projects', 'Projects', 'admin'],
       ['#/users', 'Users', 'admin'],
-      ['#/hosts', 'Hosts', 'admin'],
-      ['#/alarms', 'Alarms', 'admin'],
+    ] },
+    { title: 'Platform', admin: true, items: [
+      ['#/software', 'Software Management', 'admin'],
+      ['#/hosts', 'Host Inventory', 'admin'],
+      ['#/datanets', 'Data Networks', 'admin'],
+    ] },
+    { title: 'Fault Management', admin: true, items: [
+      ['#/alarms', 'Active Alarms', 'admin'],
+      ['#/events', 'Events', 'admin'],
     ] },
   ];
 
@@ -253,9 +260,82 @@
 
   async function pgHosts() {
     const { hosts } = await api('GET', '/api/hosts');
-    return header('Hosts') + table(['Hostname', 'Personality', 'Subfunctions', 'Administrative', 'Operational', 'Availability', 'Mgmt IP', 'CPUs', 'Memory (GB)', 'Status'],
-      hosts.map((h) => [esc(h.hostname), esc(h.personality), esc(h.subfunctions), esc(h.administrative), esc(h.operational), esc(h.availability),
-        esc(h.mgmt_ip), esc(h.cpus), esc(h.memory_gb), badge(h.status)]), 'No hosts.');
+    return header('Host Inventory') + table(['Hostname', 'Personality', 'Subfunctions', 'Administrative', 'Operational', 'Availability', 'Mgmt IP', 'CPUs', 'Memory (GB)', 'Status'],
+      hosts.map((h) => [`<a href="#/hosts/${esc(h.id)}">${esc(h.hostname)}</a>`, esc(h.personality), esc(h.subfunctions), esc(h.administrative),
+        esc(h.operational), esc(h.availability), esc(h.mgmt_ip), esc(h.cpus), esc(h.memory_gb), badge(h.status)]), 'No hosts.');
+  }
+
+  const HOST_TABS = [
+    ['cpus', 'CPU Functions', [['Processor', 'processor'], ['Core', 'core'], ['Thread', 'thread'], ['Socket', 'socket'], ['Function', 'function']]],
+    ['devices', 'Devices', [['Name', 'name'], ['Type', 'type'], ['Vendor', 'vendor'], ['Device', 'device'], ['Driver', 'driver'], ['NUMA node', 'numa_node'], ['Enabled', 'enabled']]],
+    ['filesystems', 'Filesystems', [['Mount', 'mount'], ['Size (GB)', 'size_gb'], ['Used (GB)', 'used_gb']]],
+    ['interfaces', 'Interfaces', [['Name', 'name'], ['Type', 'type'], ['Networks', 'networks'], ['IP', 'ip'], ['MTU', 'mtu'], ['VLAN', 'vlan_id'], ['Data network', 'datanet'], ['State', 'state']]],
+    ['labels', 'Kubernetes Labels', [['Key', 'key'], ['Value', 'value']]],
+    ['lldp', 'LLDP', [['Interface', 'interface'], ['Neighbour', 'neighbour'], ['Neighbour port', 'neighbour_port'], ['TTL', 'ttl']]],
+    ['memories', 'Memory', [['NUMA node', 'numa_node'], ['Total (GB)', 'total_gb'], ['Platform (GB)', 'platform_gb'], ['4K pages (GB)', 'vm_pages_4k_gb'], ['2M pages', 'vm_pages_2m'], ['1G pages', 'vm_pages_1g']]],
+    ['ports', 'Ports', [['Name', 'name'], ['Interface', 'interface'], ['Speed (Mbps)', 'speed_mbps'], ['MAC', 'mac'], ['PCI', 'pci'], ['State', 'state']]],
+    ['sensors', 'Sensors', [['Name', 'name'], ['Type', 'type'], ['Value', 'value'], ['Unit', 'unit'], ['State', 'state']]],
+    ['storages', 'Storage', [['Device', 'device'], ['Size (GB)', 'size_gb'], ['Type', 'type'], ['Function', 'function'], ['State', 'state']]],
+  ];
+
+  async function pgHostDetail(id, section) {
+    const { host } = await api('GET', `/api/hosts/${id}`);
+    const tab = HOST_TABS.find((t) => t[0] === section) || HOST_TABS[0];
+    const { [tab[0]]: rows } = await api('GET', `/api/hosts/${id}/${tab[0]}`);
+    const kv = `<div class="kv"><div>Hostname</div><div>${esc(host.hostname)}</div><div>Personality</div><div>${esc(host.personality)}</div>` +
+      `<div>Subfunctions</div><div>${esc(host.subfunctions)}</div><div>Administrative</div><div>${esc(host.administrative)}</div>` +
+      `<div>Operational</div><div>${esc(host.operational)}</div><div>Availability</div><div>${esc(host.availability)}</div>` +
+      `<div>Mgmt IP</div><div>${esc(host.mgmt_ip)}</div><div>CPUs / Memory</div><div>${esc(host.cpus)} / ${esc(host.memory_gb)} GB</div>` +
+      `<div>Status</div><div>${badge(host.status)}</div></div>`;
+    const lockBtn = host.administrative === 'unlocked'
+      ? `<button class="btn" data-act="host-lock" data-id="${id}">Lock host</button>`
+      : `<button class="btn primary" data-act="host-unlock" data-id="${id}">Unlock host</button>`;
+    const tabs = `<div class="bar" style="flex-wrap:wrap">` + HOST_TABS.map(([key, label]) =>
+      `<a class="btn small ${key === tab[0] ? 'primary' : ''}" href="#/hosts/${esc(id)}/${key}">${esc(label)}</a>`).join('') + `</div>`;
+    const body = table(tab[2].map((c) => c[0]), rows.map((r) => tab[2].map(([, k]) => esc(typeof r[k] === 'boolean' ? (r[k] ? 'Yes' : 'No') : r[k] ?? ''))), 'No entries.');
+    return header(`Host: ${host.hostname}`, lockBtn) + kv + tabs + body;
+  }
+
+  async function pgDatanets() {
+    const { datanets } = await api('GET', '/api/datanets');
+    const rows = datanets.map((d) => [
+      `<a href="#/datanets/${esc(d.id)}">${esc(d.name)}</a>`, esc(d.network_type), esc(d.mtu), esc(d.description), d.rangeCount,
+      `<button class="btn small danger" data-act="dn-delete" data-id="${d.id}" data-name="${esc(d.name)}">Delete</button>`,
+    ]);
+    return header('Data Networks', `<button class="btn primary" data-act="dn-create">Create data network</button>`) +
+      table(['Name', 'Type', 'MTU', 'Description', 'Ranges', 'Actions'], rows, 'No data networks.');
+  }
+
+  async function pgDatanetDetail(id) {
+    const { datanet: d } = await api('GET', `/api/datanets/${id}`);
+    const kv = `<div class="kv"><div>Name</div><div>${esc(d.name)}</div><div>Type</div><div>${esc(d.network_type)}</div>` +
+      `<div>MTU</div><div>${esc(d.mtu)}</div><div>Description</div><div>${esc(d.description)}</div></div>`;
+    const rows = d.ranges.map((r) => [esc(r.start), esc(r.end),
+      `<button class="btn small danger" data-act="dn-range-delete" data-id="${d.id}" data-range="${r.id}">Delete</button>`]);
+    const canRange = d.network_type !== 'flat';
+    const btn = canRange ? `<button class="btn primary" data-act="dn-range-add" data-id="${d.id}">Add range</button>` : '';
+    return header(`Data network: ${d.name}`, btn) + kv +
+      table(['Start', 'End', 'Actions'], rows, canRange ? 'No ranges. Add one to allocate segment IDs.' : 'Flat networks do not use ranges.');
+  }
+
+  async function pgSoftware() {
+    const { releases } = await api('GET', '/api/software/releases');
+    const { patches } = await api('GET', '/api/software/patches');
+    const relTable = table(['Version', 'State', 'Description', 'Installed'],
+      releases.map((r) => [esc(r.version), badge(r.state), esc(r.description), esc(fmtDate(r.installed_at))]), 'No releases.');
+    const patchTable = table(['Patch ID', 'Description', 'Release', 'Severity', 'Reboot required', 'Status', 'Actions'],
+      patches.map((p) => [esc(p.patch_id), esc(p.description), esc(p.release), badge(p.severity), p.reboot_required ? 'Yes' : 'No', esc(p.status),
+        p.status === 'Available'
+          ? `<button class="btn small primary" data-act="patch-apply" data-id="${p.id}">Apply</button>`
+          : `<button class="btn small" data-act="patch-remove" data-id="${p.id}">Remove</button>`]), 'No patches.');
+    return header('Software Management') + `<h2 style="font-size:15px">Releases</h2>` + relTable +
+      `<h2 style="font-size:15px;margin-top:20px">Patches</h2>` + patchTable;
+  }
+
+  async function pgEvents() {
+    const { events } = await api('GET', '/api/events');
+    return header('Events') + table(['Time', 'Severity', 'Event ID', 'Description', 'Entity'],
+      events.map((e) => [esc(fmtDate(e.timestamp)), badge(e.severity), esc(e.event_id), esc(e.description), esc(e.entity)]), 'No events.');
   }
 
   async function pgAlarms() {
@@ -264,15 +344,16 @@
       badge(a.severity), esc(a.alarm_id), esc(a.description), esc(a.entity), esc(a.state), esc(fmtDate(a.timestamp)),
       a.state === 'active' ? `<button class="btn small" data-act="alarm-clear" data-id="${a.id}">Clear</button>` : '',
     ]);
-    return header('Alarms') + table(['Severity', 'Alarm ID', 'Description', 'Entity', 'State', 'Raised', 'Actions'], rows, 'No alarms.');
+    return header('Active Alarms') + table(['Severity', 'Alarm ID', 'Description', 'Entity', 'State', 'Raised', 'Actions'], rows, 'No alarms.');
   }
 
   // ---------- router ----------
   const ROUTES = {
     overview: pgOverview, instances: pgInstances, volumes: pgVolumes, networks: pgNetworks, images: pgImages,
-    projects: pgProjects, users: pgUsers, hosts: pgHosts, alarms: pgAlarms,
+    projects: pgProjects, users: pgUsers, hosts: pgHosts, datanets: pgDatanets, software: pgSoftware,
+    events: pgEvents, alarms: pgAlarms,
   };
-  const ADMIN_ONLY = new Set(['projects', 'users', 'hosts', 'alarms']);
+  const ADMIN_ONLY = new Set(['projects', 'users', 'hosts', 'datanets', 'software', 'events', 'alarms']);
 
   async function render() {
     if (!token) return renderLogin();
@@ -296,6 +377,14 @@
         if (me.role !== 'admin') content = `<div class="empty">Admin role required.</div>`;
         else content = await pgProjectDetail(parts[1]);
         layout(content, '#/projects');
+      } else if (parts[0] === 'hosts' && parts[1]) {
+        if (me.role !== 'admin') content = `<div class="empty">Admin role required.</div>`;
+        else content = await pgHostDetail(parts[1], parts[2]);
+        layout(content, '#/hosts');
+      } else if (parts[0] === 'datanets' && parts[1]) {
+        if (me.role !== 'admin') content = `<div class="empty">Admin role required.</div>`;
+        else content = await pgDatanetDetail(parts[1]);
+        layout(content, '#/datanets');
       } else if (ROUTES[page]) {
         if (ADMIN_ONLY.has(page) && me.role !== 'admin') content = `<div class="empty">Admin role required.</div>`;
         else content = await ROUTES[page]();
@@ -434,6 +523,52 @@
       if (!confirm(`Delete user "${name}"?`)) return;
       await api('DELETE', `/api/users/${id}`);
       toast('User deleted');
+      await render();
+    },
+
+    'host-lock': async ({ id }) => {
+      if (!confirm('Lock this host? Workloads on it may need to move.')) return;
+      await api('POST', `/api/hosts/${id}/lock`);
+      toast('Host locked');
+      await render();
+    },
+    'host-unlock': async ({ id }) => {
+      await api('POST', `/api/hosts/${id}/unlock`);
+      toast('Host unlocked');
+      await render();
+    },
+
+    'dn-create': () => openForm('Create data network',
+      field('name', 'Name', 'text', 'required pattern="[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}"') +
+      select('network_type', 'Type', '<option value="vlan">vlan</option><option value="flat">flat</option><option value="vxlan">vxlan</option>') +
+      field('mtu', 'MTU', 'number', 'required min="1280" max="9216" value="9000"') +
+      field('description', 'Description'),
+      (data) => api('POST', '/api/datanets', data), 'Create'),
+    'dn-delete': async ({ id, name }) => {
+      if (!confirm(`Delete data network "${name}"?`)) return;
+      await api('DELETE', `/api/datanets/${id}`);
+      toast('Data network deleted');
+      await render();
+    },
+    'dn-range-add': ({ id }) => openForm('Add range',
+      field('start', 'Start ID', 'number', 'required min="1"') +
+      field('end', 'End ID', 'number', 'required min="1"'),
+      (data) => api('POST', `/api/datanets/${id}/ranges`, data), 'Add'),
+    'dn-range-delete': async ({ id, range }) => {
+      if (!confirm('Delete this range?')) return;
+      await api('DELETE', `/api/datanets/${id}/ranges/${range}`);
+      toast('Range deleted');
+      await render();
+    },
+
+    'patch-apply': async ({ id }) => {
+      await api('POST', `/api/software/patches/${id}/apply`);
+      toast('Patch applied');
+      await render();
+    },
+    'patch-remove': async ({ id }) => {
+      await api('POST', `/api/software/patches/${id}/remove`);
+      toast('Patch removed');
       await render();
     },
 

@@ -241,8 +241,142 @@ function seed() {
     });
   }
 
+  // ---- Host inventory subsections (one set of rows per host) ----
+  const DATANET_NAMES = ['physnet0', 'physnet1', 'tenant-vxlan', 'sriov-net'];
+  const hostSubs = { cpus: [], devices: [], filesystems: [], interfaces: [], labels: [], lldp: [], memories: [], ports: [], sensors: [], storages: [] };
+  const macAddr = () => `52:54:00:${hex(2)}:${hex(2)}:${hex(2)}`;
+  hosts.forEach((h, hIdx) => {
+    const isController = h.personality === 'controller';
+    const isStorage = h.personality === 'storage';
+
+    for (let c = 0; c < h.cpus; c++) {
+      hostSubs.cpus.push({
+        id: uuid(), hostId: h.id, processor: c, core: Math.floor(c / 2), thread: c % 2,
+        socket: c < h.cpus / 2 ? 0 : 1, function: c < 2 ? 'Platform' : pick(['Application', 'Shared', 'vSwitch']),
+      });
+    }
+
+    const devCount = int(2, 4);
+    for (let d = 0; d < devCount; d++) {
+      hostSubs.devices.push({
+        id: uuid(), hostId: h.id, name: `pci_0000_${(3 + d).toString(16).padStart(2, '0')}_00.0`,
+        type: 'Ethernet controller', vendor: 'Intel', device: pick(['X710', 'E810', 'XXV710']),
+        driver: 'i40e', numa_node: d % 2, enabled: true,
+      });
+    }
+
+    const mounts = isController
+      ? ['/', '/boot', '/var', '/var/log', '/var/lib/docker', '/opt/platform', '/opt/etcd']
+      : ['/', '/boot', '/var', '/var/log', '/var/lib/docker', '/opt/platform'];
+    for (const mount of mounts) {
+      const size = mount === '/var/lib/docker' ? 80 : mount === '/' ? 40 : 20;
+      hostSubs.filesystems.push({
+        id: uuid(), hostId: h.id, mount, size_gb: size, used_gb: Math.round(size * (0.2 + rnd() * 0.6) * 10) / 10,
+      });
+    }
+
+    const ifaces = [
+      { name: 'mgmt0', networks: 'mgmt', ip: h.mgmt_ip, type: 'ethernet', mtu: 9000 },
+      { name: 'cluster0', networks: 'cluster-host', ip: `192.168.206.${2 + hIdx}`, type: 'ethernet', mtu: 9000 },
+    ];
+    if (isController) ifaces.push({ name: 'oam0', networks: 'oam', ip: `10.10.10.${2 + hIdx}`, type: 'ethernet', mtu: 1500 });
+    if (!isStorage) ifaces.push({ name: 'data0', networks: 'data', ip: null, type: 'ethernet', mtu: 9000, datanet: pick(DATANET_NAMES) });
+    for (const f of ifaces) {
+      hostSubs.interfaces.push({ id: uuid(), hostId: h.id, vlan_id: null, state: 'up', datanet: null, ...f });
+      hostSubs.lldp.push({
+        id: uuid(), hostId: h.id, interface: f.name, neighbour: `tor-switch-${pick(['a', 'b'])}`,
+        neighbour_port: `Ethernet1/${int(1, 48)}`, ttl: 120,
+      });
+    }
+
+    hostSubs.labels.push({ id: uuid(), hostId: h.id, key: 'openstack-control-plane', value: isController ? 'enabled' : 'disabled' });
+    hostSubs.labels.push({ id: uuid(), hostId: h.id, key: 'sriov', value: pick(['enabled', 'disabled']) });
+
+    for (const numa of [0, 1]) {
+      hostSubs.memories.push({
+        id: uuid(), hostId: h.id, numa_node: numa, total_gb: h.memory_gb / 2, platform_gb: 4,
+        vm_pages_4k_gb: 2, vm_pages_2m: 1024, vm_pages_1g: 16,
+      });
+    }
+
+    const portCount = int(2, 4);
+    for (let p = 0; p < portCount; p++) {
+      hostSubs.ports.push({
+        id: uuid(), hostId: h.id, name: `eth${p}`, interface: ifaces[p % ifaces.length].name,
+        speed_mbps: pick([10000, 25000]), mac: macAddr(), pci: `0000:${(3 + p).toString(16).padStart(2, '0')}:00.0`, state: 'up',
+      });
+    }
+
+    for (const [name, type, unit, value] of [['CPU0 temp', 'temperature', 'C', int(40, 70)], ['Fan 1', 'fan', 'RPM', int(3000, 9000)], ['12V rail', 'voltage', 'V', 12.0]]) {
+      hostSubs.sensors.push({ id: uuid(), hostId: h.id, name, type, value, unit, state: 'ok' });
+    }
+
+    const diskCount = isStorage ? 4 : 2;
+    for (let s = 0; s < diskCount; s++) {
+      hostSubs.storages.push({
+        id: uuid(), hostId: h.id, device: `/dev/sd${String.fromCharCode(97 + s)}`, size_gb: pick([480, 960, 1920]),
+        type: 'ssd', function: isStorage ? 'osd' : s === 0 ? 'rootfs' : 'cinder', state: 'ok',
+      });
+    }
+  });
+
+  // ---- Data networks (providernets) ----
+  const datanets = [
+    { name: 'physnet0', network_type: 'vlan', mtu: 9000, description: 'Primary tenant VLAN network', ranges: [{ start: 100, end: 199 }] },
+    { name: 'physnet1', network_type: 'flat', mtu: 1500, description: 'Flat provider network', ranges: [] },
+    { name: 'tenant-vxlan', network_type: 'vxlan', mtu: 9000, description: 'VXLAN overlay network', ranges: [{ start: 1000, end: 1999 }] },
+    { name: 'sriov-net', network_type: 'vlan', mtu: 9000, description: 'SR-IOV passthrough network', ranges: [{ start: 2000, end: 2099 }] },
+  ].map((d) => ({
+    id: uuid(), name: d.name, network_type: d.network_type, mtu: d.mtu, description: d.description,
+    ranges: d.ranges.map((r) => ({ id: uuid(), ...r })), createdAt: pastDate(300),
+  }));
+
+  // ---- Software management ----
+  const releases = [
+    { id: uuid(), version: '10.0.0', state: 'deployed', description: 'Base release', installed_at: pastDate(200) },
+    { id: uuid(), version: '10.0.1', state: 'deployed', description: 'First maintenance release', installed_at: pastDate(90) },
+    { id: uuid(), version: '10.0.2', state: 'available', description: 'Second maintenance release', installed_at: null },
+  ];
+  const PATCHES = [
+    ['STX-SEC-2026-001', 'Kernel security update', true, 'high'],
+    ['STX-SEC-2026-002', 'OpenSSL security fix', false, 'high'],
+    ['STX-BUG-2026-014', 'Ceph OSD restart fix', false, 'low'],
+    ['STX-BUG-2026-021', 'PTP holdover correction', false, 'low'],
+    ['STX-SEC-2026-007', 'containerd security update', false, 'high'],
+    ['STX-BUG-2026-033', 'Horizon session timeout fix', false, 'low'],
+  ];
+  const patches = PATCHES.map(([patchId, description, rebootRequired, severity], i) => ({
+    id: uuid(), patch_id: patchId, description, reboot_required: rebootRequired, severity,
+    release: i < 3 ? '10.0.1' : '10.0.2', status: i < 2 ? 'Applied' : 'Available',
+  }));
+
+  // ---- Events (log entries, read-only) ----
+  const EVENT_TYPES = [
+    { event_id: '100.101', severity: 'warning', description: 'Platform CPU threshold reached' },
+    { event_id: '200.005', severity: 'info', description: 'Host configuration applied' },
+    { event_id: '200.009', severity: 'info', description: 'Host unlocked' },
+    { event_id: '200.011', severity: 'info', description: 'Host locked' },
+    { event_id: '400.001', severity: 'log', description: 'Service started' },
+    { event_id: '400.003', severity: 'warning', description: 'Service restart requested' },
+    { event_id: '300.002', severity: 'critical', description: 'Storage monitor reported a failed OSD' },
+  ];
+  const events = [];
+  for (let i = 0; i < 60; i++) {
+    const t = pick(EVENT_TYPES);
+    events.push({
+      id: uuid(), event_id: t.event_id, severity: t.severity, description: t.description,
+      entity: `host=${pick(hosts).hostname}`, timestamp: pastDate(14),
+    });
+  }
+  events.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
+
   return {
     users: userRecords,
+    datanets,
+    hostSubs,
+    releases,
+    patches,
+    events,
     projects,
     memberships,
     networks,

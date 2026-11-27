@@ -7,12 +7,15 @@
 - **Projects instead of tenants.** Users are added to projects with a role per project (`admin`, `member`, `reader`). Platform admins see every project.
 - **Seeded data** (identical on every start, from a fixed seed):
   - 14 projects, 120 users (3 platform admins), 300 instances, 180 volumes, 41 networks, 12 images, 8 flavors, 8 hosts, 40 alarms.
-- **Pages:** Overview, Instances (launch, start, stop, reboot, delete), Volumes (create, attach, detach, delete), Networks (create, delete), Images, and admin-only Projects (create, enable/disable, delete, members), Users (create, edit, delete), Hosts, Alarms (clear).
-- **REST API** under `/api` with bearer-token auth. Use the browser UI or the API.
+- **Pages:** Overview, Instances (launch, start, stop, reboot, delete), Volumes (create, attach, detach, delete), Networks (create, delete), Images, and admin-only:
+  - Projects (create, enable/disable, delete, members) and Users (create, edit, delete)
+  - Platform: Software Management (apply and remove patches), Host Inventory (lock and unlock hosts; 10 subpages: CPU functions, devices, filesystems, interfaces, Kubernetes labels, LLDP, memory, ports, sensors, storage), Data Networks (create, delete, add and remove VLAN/VXLAN ranges)
+  - Fault Management: Active Alarms (clear), Events (read-only log)
+- **REST API** under `/api` with bearer-token auth, 51 endpoints. Use the browser UI or the API.
 - **No planted vulnerabilities.** Access rules are enforced. Members see only their own projects, and admin APIs return 403 to members.
 
 ## Demo accounts
-
+# URL https://starlingx-horizon-demo.onrender.com
 Password for every account: `Demo@123`
 
 | Role | Email |
