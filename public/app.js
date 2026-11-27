@@ -243,7 +243,8 @@
       esc(fmtDate(m.addedAt)),
       `<button class="btn small danger" data-act="mem-remove" data-pid="${id}" data-uid="${m.userId}">Remove</button>`,
     ]);
-    return header(`Project: ${project.name}`) + kv + header('Members', buttons) +
+    const toggle = `<button class="btn" data-act="proj-toggle" data-id="${id}" data-enabled="${project.enabled}">${project.enabled ? 'Disable project' : 'Enable project'}</button>`;
+    return header(`Project: ${project.name}`, toggle) + kv + header('Members', buttons) +
       table(['Name', 'Email', 'Role in project', 'Added', 'Actions'], rows, 'No members yet. Add users to give them access.');
   }
 
